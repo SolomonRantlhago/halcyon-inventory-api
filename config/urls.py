@@ -10,4 +10,5 @@ urlpatterns = [
     path("admin/", admin.site.urls),
     path("health/", HealthView.as_view(), name="health"),
     path("api/auth/", include("accounts.urls")),
+    path("api/", include("inventory.urls")),
 ]
