@@ -49,3 +49,9 @@ class ErrorHandlingTests(APITestCase):
         ):
             response = self.client.get("/api/suppliers/")
         self.assertEqual(response.status_code, 409)
+
+    def test_schema_and_docs_available(self):
+        schema = self.client.get("/api/schema/", {"format": "json"})
+        self.assertEqual(schema.status_code, 200)
+        self.assertEqual(self.client.get("/api/docs/").status_code, 200)
+        self.assertEqual(self.client.get("/api/redoc/").status_code, 200)
