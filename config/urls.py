@@ -1,5 +1,5 @@
 from django.contrib import admin
-from django.urls import path
+from django.urls import include, path
 
 from core.views import HealthView
 
@@ -9,4 +9,5 @@ handler500 = "core.views.server_error"
 urlpatterns = [
     path("admin/", admin.site.urls),
     path("health/", HealthView.as_view(), name="health"),
+    path("api/auth/", include("accounts.urls")),
 ]
