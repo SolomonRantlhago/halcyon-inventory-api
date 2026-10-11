@@ -1,4 +1,4 @@
-from inventory.models import Product, PurchaseOrder, StockLevel, Warehouse
+from inventory.models import Product, PurchaseOrder, StockLevel, Supplier, Warehouse
 from inventory.tests.base import InventoryTestCase
 
 
@@ -143,6 +143,13 @@ class ProductTests(InventoryTestCase):
         skus = {p["sku"] for p in self.client.get("/api/products/low-stock/").json()["results"]}
         self.assertEqual(skus, {"GADGET-1"})
 
+    def test_delete_product_on_order_is_409(self):
+        self.as_alice()
+        self.client.post("/api/purchase-orders/", self.order_payload(), format="json")
+        self.as_admin()
+        response = self.client.delete(f"/api/products/{self.product.pk}/")
+        self.assertEqual(response.status_code, 409)
+
 
 class StockLevelTests(InventoryTestCase):
     def test_admin_crud_and_filters(self):
@@ -177,6 +184,113 @@ class StockLevelTests(InventoryTestCase):
             f"/api/stock-levels/{self.stock.pk}/", {"quantity": -5}, format="json"
         )
         self.assertEqual(response.status_code, 400)
+
+
+class PurchaseOrderTests(InventoryTestCase):
+    def create_order(self):
+        self.as_alice()
+        response = self.client.post(
+            "/api/purchase-orders/", self.order_payload(), format="json"
+        )
+        self.assertEqual(response.status_code, 201, response.content)
+        return response.json()
+
+    def test_create_defaults_cost_and_owner(self):
+        body = self.create_order()
+        self.assertEqual(body["status"], "pending")
+        self.assertEqual(body["created_by"], self.alice.pk)
+        self.assertEqual(body["items"][0]["unit_cost"], "10.00")
+        self.assertEqual(body["total"], "100.00")
+
+    def test_rejects_product_not_supplied_by_supplier(self):
+        self.as_alice()
+        payload = self.order_payload(items=[{"product": self.unsupplied.pk, "quantity": 1}])
+        response = self.client.post("/api/purchase-orders/", payload, format="json")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("items", response.json()["error"]["details"])
+
+    def test_rejects_empty_duplicate_and_inactive(self):
+        self.as_alice()
+        for payload in (
+            self.order_payload(items=[]),
+            self.order_payload(items=[
+                {"product": self.product.pk, "quantity": 1},
+                {"product": self.product.pk, "quantity": 2},
+            ]),
+            self.order_payload(items=[{"product": self.product.pk, "quantity": 0}]),
+        ):
+            response = self.client.post("/api/purchase-orders/", payload, format="json")
+            self.assertEqual(response.status_code, 400)
+        Supplier.objects.filter(pk=self.supplier.pk).update(is_active=False)
+        response = self.client.post(
+            "/api/purchase-orders/", self.order_payload(), format="json"
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_standard_user_only_sees_own_orders(self):
+        order = self.create_order()
+        self.client.force_authenticate(self.bob)
+        self.assertEqual(self.client.get("/api/purchase-orders/").json()["count"], 0)
+        self.assertEqual(
+            self.client.get(f"/api/purchase-orders/{order['id']}/").status_code, 404
+        )
+        self.as_admin()
+        self.assertEqual(self.client.get("/api/purchase-orders/").json()["count"], 1)
+        filtered = self.client.get("/api/purchase-orders/", {"status": "received"}).json()
+        self.assertEqual(filtered["count"], 0)
+
+    def test_edit_pending_order_and_replace_items(self):
+        order = self.create_order()
+        url = f"/api/purchase-orders/{order['id']}/"
+        response = self.client.patch(
+            url, {"items": [{"product": self.product.pk, "quantity": 2, "unit_cost": "9.00"}]},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(response.json()["total"], "18.00")
+        response = self.client.patch(url, {"notes": "Updated"}, format="json")
+        self.assertEqual(response.json()["notes"], "Updated")
+        self.assertEqual(len(response.json()["items"]), 1)
+
+    def test_only_admin_can_approve_and_receive(self):
+        order = self.create_order()
+        url = f"/api/purchase-orders/{order['id']}"
+        self.assertEqual(self.client.post(f"{url}/approve/").status_code, 403)
+        self.assertEqual(self.client.post(f"{url}/receive/").status_code, 403)
+
+    def test_full_fulfilment_flow_updates_stock(self):
+        order = self.create_order()
+        url = f"/api/purchase-orders/{order['id']}"
+        self.as_admin()
+        premature = self.client.post(f"{url}/receive/")
+        self.assertEqual(premature.status_code, 409)
+        self.assertEqual(self.client.post(f"{url}/approve/").json()["status"], "approved")
+        self.assertEqual(self.client.post(f"{url}/receive/").json()["status"], "received")
+        self.stock.refresh_from_db()
+        self.assertEqual(self.stock.quantity, 13)
+        # Received orders are immutable.
+        self.assertEqual(
+            self.client.patch(f"{url}/", {"notes": "x"}, format="json").status_code, 409
+        )
+        self.assertEqual(self.client.delete(f"{url}/").status_code, 409)
+        self.assertEqual(self.client.post(f"{url}/cancel/").status_code, 409)
+
+    def test_owner_can_cancel_and_delete_pending(self):
+        order = self.create_order()
+        url = f"/api/purchase-orders/{order['id']}"
+        self.assertEqual(self.client.post(f"{url}/cancel/").json()["status"], "cancelled")
+        second = self.client.post(
+            "/api/purchase-orders/", self.order_payload(), format="json"
+        ).json()
+        response = self.client.delete(f"/api/purchase-orders/{second['id']}/")
+        self.assertEqual(response.status_code, 204)
+        self.assertEqual(PurchaseOrder.objects.count(), 1)
+
+    def test_other_user_cannot_cancel(self):
+        order = self.create_order()
+        self.client.force_authenticate(self.bob)
+        response = self.client.post(f"/api/purchase-orders/{order['id']}/cancel/")
+        self.assertEqual(response.status_code, 404)
 
 
 class SmokeTests(InventoryTestCase):

@@ -1,13 +1,17 @@
 from django.db.models import F, Sum
 from django.db.models.functions import Coalesce
 from drf_spectacular.utils import extend_schema
-from rest_framework import viewsets
+from rest_framework import status, viewsets
 from rest_framework.decorators import action
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
 
-from core.permissions import IsAdminOrReadOnly
-from inventory.models import Product, StockLevel, Supplier, Warehouse
+from core.exceptions import ConflictError
+from core.permissions import IsAdmin, IsAdminOrReadOnly, IsOwnerOrAdmin, is_admin
+from inventory.models import Product, PurchaseOrder, StockLevel, Supplier, Warehouse
 from inventory.serializers import (
     ProductSerializer,
+    PurchaseOrderSerializer,
     StockLevelSerializer,
     SupplierSerializer,
     WarehouseSerializer,
@@ -73,3 +77,59 @@ class StockLevelViewSet(viewsets.ModelViewSet):
         if params.get("product"):
             qs = qs.filter(product_id=params["product"])
         return qs
+
+
+class PurchaseOrderViewSet(viewsets.ModelViewSet):
+    serializer_class = PurchaseOrderSerializer
+    search_fields = ["reference", "notes"]
+    ordering_fields = ["created_at", "status"]
+
+    def get_queryset(self):
+        if getattr(self, "swagger_fake_view", False):
+            return PurchaseOrder.objects.none()  # schema generation has no real user
+        qs = PurchaseOrder.objects.select_related(
+            "supplier", "warehouse", "created_by"
+        ).prefetch_related("items__product")
+        if not is_admin(self.request.user):
+            qs = qs.filter(created_by=self.request.user)
+        status_param = self.request.query_params.get("status")
+        if status_param:
+            qs = qs.filter(status=status_param)
+        return qs
+
+    def get_permissions(self):
+        if self.action in ("approve", "receive"):
+            return [IsAuthenticated(), IsAdmin()]
+        return [IsAuthenticated(), IsOwnerOrAdmin()]
+
+    def perform_create(self, serializer):
+        serializer.save(created_by=self.request.user)
+
+    def perform_destroy(self, instance):
+        if instance.status != PurchaseOrder.Status.PENDING:
+            raise ConflictError("Only pending orders can be deleted; cancel it instead.")
+        instance.delete()
+
+    def _transition(self, request, method_name):
+        order = self.get_object()
+        getattr(order, method_name)()
+        order = self.get_queryset().get(pk=order.pk)
+        return Response(self.get_serializer(order).data, status=status.HTTP_200_OK)
+
+    @extend_schema(request=None, responses=PurchaseOrderSerializer)
+    @action(detail=True, methods=["post"])
+    def approve(self, request, pk=None):
+        """Admin: pending -> approved."""
+        return self._transition(request, "approve")
+
+    @extend_schema(request=None, responses=PurchaseOrderSerializer)
+    @action(detail=True, methods=["post"])
+    def receive(self, request, pk=None):
+        """Admin: approved -> received, adding stock to the destination warehouse."""
+        return self._transition(request, "receive")
+
+    @extend_schema(request=None, responses=PurchaseOrderSerializer)
+    @action(detail=True, methods=["post"])
+    def cancel(self, request, pk=None):
+        """Owner or admin: pending/approved -> cancelled."""
+        return self._transition(request, "cancel")
