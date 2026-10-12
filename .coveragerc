@@ -1,0 +1,13 @@
+[run]
+source = .
+omit =
+    */migrations/*
+    */tests/*
+    manage.py
+    config/wsgi.py
+    config/asgi.py
+    venv/*
+    staticfiles/*
+
+[report]
+show_missing = True
