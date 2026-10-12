@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    name: Lint (flake8)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+      - run: flake8 .
+
+  test:
+    name: Test (PostgreSQL)
+    needs: lint
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: inventory
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # Django creates and destroys a throwaway test_inventory database for the run.
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/inventory
+      SECRET_KEY: ci-only-secret-key
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+      - name: Check for missing migrations
+        run: python manage.py makemigrations --check --dry-run
+      - name: Run tests with coverage
+        run: coverage run manage.py test
+      - name: Enforce 80% coverage
+        run: coverage report --fail-under=80
+
+  build:
+    name: Build Docker image
+    needs: test
+    runs-on: ubuntu-latest
+    env:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: halcyon-inventory-api:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      # Optional: publish to DockerHub from main when credentials are configured.
+      - name: Log in to DockerHub
+        if: github.ref == 'refs/heads/main' && env.DOCKERHUB_USERNAME != ''
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Push image
+        if: github.ref == 'refs/heads/main' && env.DOCKERHUB_USERNAME != ''
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/halcyon-inventory-api:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/halcyon-inventory-api:${{ github.sha }}
+          cache-from: type=gha
